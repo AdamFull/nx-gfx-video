@@ -21,7 +21,7 @@ if (NOT TARGET nx::gfx)
     set(NX_FOUNDATION_TESTS ${NX_GFX_VIDEO_TESTS})
     FetchContent_Declare(nx_gfx
             GIT_REPOSITORY https://github.com/AdamFull/nx-gfx.git
-            GIT_TAG 140b82051e4553adf9b88651092982e34bbd9a6d)
+            GIT_TAG 2dd338491552650817c0671e19af6ed438e8a00f)
     FetchContent_MakeAvailable(nx_gfx)
 endif ()
 
