@@ -36,11 +36,18 @@ nx::gfx::video::video_decoder decoder;
 if (decoder.init(*made.value(), nx::gfx::video::video_codec::VP9, width, height)) {
   bool shown = false;
   u32 w = 0, h = 0;
-  if (decoder.decode_frame(frame, size, shown, w, h) && shown) {
+  if (decoder.decode_frame(frame, size, shown, w, h) && shown &&
+      decoder.show_last()) {
     // sample decoder.luma_texture() and decoder.chroma_texture()
   }
 }
 ```
+
+`show_last` copies the picture on the decode queue into a pair of plane images
+the device adopts (`nx::gfx::vk::wrap`), so the textures change with every
+picture shown and the previous ones retire as any texture does. The decoder
+keeps at most eight pairs; while frames still read all of them, `show_last`
+fails and the last picture stays.
 
 `query_decode_caps` reports what a device can decode without making a session;
 `parse_vp9_frame_header` (`nx/gfx/video/vp9.h`) reads the uncompressed VP9

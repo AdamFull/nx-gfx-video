@@ -6,10 +6,13 @@
 #include "nx/gfx/video/vp9.h"
 #include "nx/gfx/vulkan.h"
 
+#include "core/foundation/core/foundation.h"
 #include "core/foundation/diagnostics/log.h"
 
+#include <atomic>
 #include <cstring>
 #include <limits>
+#include <span>
 
 namespace gfx = nx::gfx;
 
@@ -186,14 +189,13 @@ namespace {
 }
 
 [[nodiscard]] bool
-create_video_image(const gfx::device &owner, const VkPhysicalDevice phys,
-                   const VkVideoProfileListInfoKHR &profiles,
-                   const VkFormat format, const VkExtent2D extent,
-                   const VkImageUsageFlags usage, const u32 *const families,
-                   const u32 family_count, video_image &out) {
+create_image(const gfx::device &owner, const VkPhysicalDevice phys,
+             const void *const pNext, const VkFormat format,
+             const VkExtent2D extent, const VkImageUsageFlags usage,
+             const std::span<const u32> families, video_image &out) {
   const VkDevice dev = gfx::vk::logical_device(owner);
   VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-  ci.pNext = &profiles;
+  ci.pNext = pNext;
   ci.imageType = VK_IMAGE_TYPE_2D;
   ci.format = format;
   ci.extent = {extent.width, extent.height, 1};
@@ -202,12 +204,10 @@ create_video_image(const gfx::device &owner, const VkPhysicalDevice phys,
   ci.samples = VK_SAMPLE_COUNT_1_BIT;
   ci.tiling = VK_IMAGE_TILING_OPTIMAL;
   ci.usage = usage;
-  // The decode queue writes these; a transfer or graphics queue reads them
-  // back. Concurrent sharing spares an ownership hand-off between the two.
-  if (family_count > 1) {
+  if (families.size() > 1) {
     ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
-    ci.queueFamilyIndexCount = family_count;
-    ci.pQueueFamilyIndices = families;
+    ci.queueFamilyIndexCount = nx::cast<u32>(families.size());
+    ci.pQueueFamilyIndices = families.data();
   } else {
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   }
@@ -227,10 +227,21 @@ create_video_image(const gfx::device &owner, const VkPhysicalDevice phys,
   if (NX_GFX_VK_CHECK(owner, vkAllocateMemory(dev, &ai, nullptr,
                                               &out.memory)) != VK_SUCCESS)
     return false;
-  if (NX_GFX_VK_CHECK(owner, vkBindImageMemory(dev, out.image, out.memory,
-                                               0)) != VK_SUCCESS)
+  return NX_GFX_VK_CHECK(owner, vkBindImageMemory(dev, out.image, out.memory,
+                                                  0)) == VK_SUCCESS;
+}
+
+[[nodiscard]] bool
+create_video_image(const gfx::device &owner, const VkPhysicalDevice phys,
+                   const VkVideoProfileListInfoKHR &profiles,
+                   const VkFormat format, const VkExtent2D extent,
+                   const VkImageUsageFlags usage, const u32 video_family,
+                   video_image &out) {
+  if (!create_image(owner, phys, &profiles, format, extent, usage,
+                    {&video_family, 1}, out))
     return false;
 
+  const VkDevice dev = gfx::vk::logical_device(owner);
   VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   vi.image = out.image;
   vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -303,6 +314,43 @@ void destroy_video_image(const VkDevice dev, video_image &image) {
 
 } // namespace
 
+// The device hands a pair back once no frame can read it, which may be after
+// the decoder is gone: the decoder and every wrapped plane count as users.
+struct video_decoder::plane_pair {
+  plane_pool *pool = nullptr;
+  video_image y;
+  video_image cbcr;
+  std::atomic<u32> wrapped{0};
+};
+
+struct video_decoder::plane_pool {
+  static constexpr u32 MAX_PAIRS = 8;
+
+  explicit plane_pool(const VkDevice owner) noexcept : device(owner) {}
+
+  void drop() noexcept {
+    if (users.fetch_sub(1, std::memory_order_acq_rel) != 1)
+      return;
+    for (u32 i = 0; i < count; ++i) {
+      destroy_video_image(device, pairs[i].y);
+      destroy_video_image(device, pairs[i].cbcr);
+    }
+    nx::release(this);
+  }
+
+  static void release_plane(void *const user, VkImage) noexcept {
+    plane_pair *const pair = static_cast<plane_pair *>(user);
+    plane_pool *const pool = pair->pool;
+    pair->wrapped.fetch_sub(1, std::memory_order_release);
+    pool->drop();
+  }
+
+  VkDevice device = VK_NULL_HANDLE;
+  std::atomic<u32> users{1};
+  plane_pair pairs[MAX_PAIRS];
+  u32 count = 0;
+};
+
 video_decoder::~video_decoder() { shutdown(); }
 
 void video_decoder::shutdown() noexcept {
@@ -315,11 +363,6 @@ void video_decoder::shutdown() noexcept {
       gfx::destroy_texture(*m_device, m_y);
     if (m_cbcr.valid())
       gfx::destroy_texture(*m_device, m_cbcr);
-    destroy_video_image(dev, m_sampleable);
-    if (m_gfx_fence != VK_NULL_HANDLE)
-      vkDestroyFence(dev, m_gfx_fence, nullptr);
-    if (m_gfx_pool != VK_NULL_HANDLE)
-      vkDestroyCommandPool(dev, m_gfx_pool, nullptr);
 
     if (m_bitstream_mapped != nullptr)
       vkUnmapMemory(dev, m_bitstream_memory);
@@ -339,11 +382,14 @@ void video_decoder::shutdown() noexcept {
     for (const VkDeviceMemory memory : m_memories)
       vkFreeMemory(dev, memory, nullptr);
   }
+  if (m_planes != nullptr)
+    m_planes->drop();
+  m_planes = nullptr;
+  m_plane_families.clear();
   m_session = VK_NULL_HANDLE;
   m_memories.clear();
   m_dpb.clear();
   m_output = {};
-  m_sampleable = {};
   m_coincide = false;
   m_pool = VK_NULL_HANDLE;
   m_cmd = VK_NULL_HANDLE;
@@ -361,9 +407,6 @@ void video_decoder::shutdown() noexcept {
   m_next_slot = 0;
   m_last_slot = 0;
   m_have_last = false;
-  m_gfx_pool = VK_NULL_HANDLE;
-  m_gfx_cmd = VK_NULL_HANDLE;
-  m_gfx_fence = VK_NULL_HANDLE;
   m_y = {};
   m_cbcr = {};
   m_device = nullptr;
@@ -551,7 +594,6 @@ bool video_decoder::init(gfx::device &device, const video_codec codec,
     return false;
   }
 
-  const u32 families[2] = {m_video_family, gfx::vk::graphics_family(device)};
   const VkImageUsageFlags dpb_usage =
       (coincide ? (VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR |
                    VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR)
@@ -560,7 +602,7 @@ bool video_decoder::init(gfx::device &device, const video_codec codec,
   m_dpb.resize(m_max_dpb_slots);
   for (video_image &slot : m_dpb) {
     if (!create_video_image(device, phys, profiles, m_dpb_format, m_extent,
-                            dpb_usage, families, 2, slot)) {
+                            dpb_usage, m_video_family, slot)) {
       nx::logw(nx::log::rhi, "video: dpb image allocation failed");
       shutdown();
       return false;
@@ -570,15 +612,20 @@ bool video_decoder::init(gfx::device &device, const video_codec codec,
       !create_video_image(device, phys, profiles, m_picture_format, m_extent,
                           VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR |
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                          families, 2, m_output)) {
+                          m_video_family, m_output)) {
     nx::logw(nx::log::rhi, "video: output image allocation failed");
     shutdown();
     return false;
   }
 
-  if (!create_command_resources() ||
-      !create_bitstream_buffer(size_t{1} << 20, profiles) ||
-      !create_sampleable_image(families, 2) || !create_plane_resources()) {
+  m_plane_families.clear();
+  m_plane_families.push_back(m_video_family);
+  for (const u32 family : gfx::vk::queue_families(device))
+    if (family != m_video_family)
+      m_plane_families.push_back(family);
+  m_planes = nx::allocate<plane_pool>(dev);
+  if (m_planes == nullptr || !create_command_resources() ||
+      !create_bitstream_buffer(size_t{1} << 20, profiles)) {
     shutdown();
     return false;
   }
@@ -876,56 +923,68 @@ bool video_decoder::decode(const u8 *const frame, const u32 size,
   return true;
 }
 
-bool video_decoder::create_sampleable_image(const u32 *const families,
-                                            const u32 family_count) {
-  const VkDevice dev = gfx::vk::logical_device(*m_device);
-  VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-  ci.imageType = VK_IMAGE_TYPE_2D;
-  ci.format = m_picture_format;
-  ci.extent = {m_extent.width, m_extent.height, 1};
-  ci.mipLevels = 1;
-  ci.arrayLayers = 1;
-  ci.samples = VK_SAMPLE_COUNT_1_BIT;
-  ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-  ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-             VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-  if (family_count > 1) {
-    ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
-    ci.queueFamilyIndexCount = family_count;
-    ci.pQueueFamilyIndices = families;
-  } else {
-    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  }
-  ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (NX_GFX_VK_CHECK(*m_device,
-                      vkCreateImage(dev, &ci, nullptr, &m_sampleable.image)) !=
-      VK_SUCCESS)
-    return false;
+video_decoder::plane_pair *video_decoder::free_planes() {
+  for (u32 i = 0; i < m_planes->count; ++i)
+    if (m_planes->pairs[i].wrapped.load(std::memory_order_acquire) == 0)
+      return &m_planes->pairs[i];
+  if (m_planes->count == plane_pool::MAX_PAIRS)
+    return nullptr;
 
-  VkMemoryRequirements mr;
-  vkGetImageMemoryRequirements(dev, m_sampleable.image, &mr);
-  const u32 type = session_memory_type(gfx::vk::physical_device(*m_device),
-                                       mr.memoryTypeBits);
-  if (type == ~0u)
-    return false;
-  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  ai.allocationSize = mr.size;
-  ai.memoryTypeIndex = type;
-  if (NX_GFX_VK_CHECK(*m_device, vkAllocateMemory(dev, &ai, nullptr,
-                                                  &m_sampleable.memory)) !=
-      VK_SUCCESS)
-    return false;
-  return NX_GFX_VK_CHECK(*m_device, vkBindImageMemory(dev, m_sampleable.image,
-                                                      m_sampleable.memory,
-                                                      0)) == VK_SUCCESS;
+  plane_pair &pair = m_planes->pairs[m_planes->count];
+  const VkPhysicalDevice phys = gfx::vk::physical_device(*m_device);
+  const std::span<const u32> families(m_plane_families.data(),
+                                      m_plane_families.size());
+  constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  if (!create_image(*m_device, phys, nullptr, VK_FORMAT_R8_UNORM, m_extent,
+                    usage, families, pair.y) ||
+      !create_image(*m_device, phys, nullptr, VK_FORMAT_R8G8_UNORM,
+                    {m_extent.width / 2, m_extent.height / 2}, usage, families,
+                    pair.cbcr)) {
+    const VkDevice dev = gfx::vk::logical_device(*m_device);
+    destroy_video_image(dev, pair.y);
+    destroy_video_image(dev, pair.cbcr);
+    return nullptr;
+  }
+  pair.pool = m_planes;
+  ++m_planes->count;
+  return &pair;
+}
+
+gfx::texture_handle video_decoder::wrap_plane(plane_pair &pair,
+                                              const video_image &plane,
+                                              const gfx::format format,
+                                              const VkExtent2D extent,
+                                              const nx::string_view name) {
+  m_planes->users.fetch_add(1, std::memory_order_relaxed);
+  pair.wrapped.fetch_add(1, std::memory_order_relaxed);
+  const gfx::texture_handle handle =
+      gfx::vk::wrap(*m_device, {.name = name,
+                                .image = plane.image,
+                                .format = format,
+                                .width = extent.width,
+                                .height = extent.height,
+                                .usage = gfx::texture_usage::Sampled |
+                                         gfx::texture_usage::CopySrc,
+                                .state = gfx::resource_state::ShaderReadOnly,
+                                .release = &plane_pool::release_plane,
+                                .user = &pair});
+  if (!handle.valid()) {
+    pair.wrapped.fetch_sub(1, std::memory_order_relaxed);
+    m_planes->users.fetch_sub(1, std::memory_order_relaxed);
+  }
+  return handle;
 }
 
 bool video_decoder::present(const u32 slot) {
-  if (!ready() || !m_video_supports_transfer)
+  if (!ready() || !m_video_supports_transfer ||
+      (m_coincide && slot >= m_dpb.size()))
+    return false;
+  plane_pair *const planes = free_planes();
+  if (planes == nullptr)
     return false;
   video_image &src = m_coincide ? m_dpb[slot] : m_output;
-  if (m_coincide && slot >= m_dpb.size())
-    return false;
   const VkImageLayout restore = m_coincide
                                     ? VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR
                                     : VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR;
@@ -958,22 +1017,32 @@ bool video_decoder::present(const u32 slot) {
     vkCmdPipelineBarrier2KHR(m_cmd, &dep);
   };
 
+  // A free pair's last contents were shown already; frames may have left it
+  // in any layout.
+  planes->y.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  planes->cbcr.layout = VK_IMAGE_LAYOUT_UNDEFINED;
   barrier(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-  barrier(m_sampleable, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  barrier(planes->y, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  barrier(planes->cbcr, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
-  VkImageCopy regions[2]{};
-  regions[0].srcSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1};
-  regions[0].dstSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1};
-  regions[0].extent = {m_extent.width, m_extent.height, 1};
-  regions[1].srcSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1};
-  regions[1].dstSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1};
-  regions[1].extent = {m_extent.width / 2, m_extent.height / 2, 1};
-  vkCmdCopyImage(m_cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                 m_sampleable.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2,
-                 regions);
+  const auto copy_plane = [&](const VkImageAspectFlagBits aspect,
+                              const video_image &dst, const u32 w,
+                              const u32 h) {
+    VkImageCopy region{};
+    region.srcSubresource = {nx::cast<VkImageAspectFlags>(aspect), 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.extent = {w, h, 1};
+    vkCmdCopyImage(m_cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  };
+  copy_plane(VK_IMAGE_ASPECT_PLANE_0_BIT, planes->y, m_extent.width,
+             m_extent.height);
+  copy_plane(VK_IMAGE_ASPECT_PLANE_1_BIT, planes->cbcr, m_extent.width / 2,
+             m_extent.height / 2);
 
   barrier(src, restore);
-  barrier(m_sampleable, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  barrier(planes->y, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  barrier(planes->cbcr, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   NX_GFX_VK_TRY(*m_device, vkEndCommandBuffer(m_cmd));
 
   NX_GFX_VK_TRY(*m_device, vkResetFences(dev, 1, &m_fence));
@@ -982,51 +1051,26 @@ bool video_decoder::present(const u32 slot) {
   submit.pCommandBuffers = &m_cmd;
   NX_GFX_VK_TRY(*m_device, vkQueueSubmit(m_video_queue, 1, &submit, m_fence));
   NX_GFX_VK_TRY(*m_device, vkWaitForFences(dev, 1, &m_fence, VK_TRUE, ~0ull));
+
+  const gfx::texture_handle y = wrap_plane(
+      *planes, planes->y, gfx::format::R8_UNORM, m_extent, "video luma");
+  const gfx::texture_handle cbcr =
+      wrap_plane(*planes, planes->cbcr, gfx::format::RG8_UNORM,
+                 {m_extent.width / 2, m_extent.height / 2}, "video chroma");
+  if (!y.valid() || !cbcr.valid()) {
+    if (y.valid())
+      gfx::destroy_texture(*m_device, y);
+    if (cbcr.valid())
+      gfx::destroy_texture(*m_device, cbcr);
+    return false;
+  }
+  if (m_y.valid())
+    gfx::destroy_texture(*m_device, m_y);
+  if (m_cbcr.valid())
+    gfx::destroy_texture(*m_device, m_cbcr);
+  m_y = y;
+  m_cbcr = cbcr;
   return true;
-}
-
-bool video_decoder::create_plane_resources() {
-  const VkDevice dev = gfx::vk::logical_device(*m_device);
-
-  VkCommandPoolCreateInfo cpc{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-  cpc.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  cpc.queueFamilyIndex = gfx::vk::graphics_family(*m_device);
-  if (NX_GFX_VK_CHECK(*m_device,
-                      vkCreateCommandPool(dev, &cpc, nullptr, &m_gfx_pool)) !=
-      VK_SUCCESS)
-    return false;
-  VkCommandBufferAllocateInfo cba{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  cba.commandPool = m_gfx_pool;
-  cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cba.commandBufferCount = 1;
-  if (NX_GFX_VK_CHECK(*m_device, vkAllocateCommandBuffers(
-                                     dev, &cba, &m_gfx_cmd)) != VK_SUCCESS)
-    return false;
-  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  if (NX_GFX_VK_CHECK(*m_device, vkCreateFence(dev, &fci, nullptr,
-                                               &m_gfx_fence)) != VK_SUCCESS)
-    return false;
-
-  gfx::texture_desc luma;
-  luma.name = "video luma";
-  luma.format = gfx::format::R8_UNORM;
-  luma.width = m_extent.width;
-  luma.height = m_extent.height;
-  luma.usage = gfx::texture_usage::Sampled | gfx::texture_usage::CopyDst |
-               gfx::texture_usage::CopySrc;
-  m_y = gfx::create_texture(*m_device, luma);
-
-  gfx::texture_desc chroma;
-  chroma.name = "video chroma";
-  chroma.format = gfx::format::RG8_UNORM;
-  chroma.width = m_extent.width / 2;
-  chroma.height = m_extent.height / 2;
-  chroma.usage = gfx::texture_usage::Sampled | gfx::texture_usage::CopyDst |
-                 gfx::texture_usage::CopySrc;
-  m_cbcr = gfx::create_texture(*m_device, chroma);
-
-  return m_y.valid() && m_cbcr.valid();
 }
 
 bool video_decoder::decode_frame(const u8 *const frame, const u32 size,
@@ -1051,84 +1095,7 @@ void video_decoder::reset_stream() noexcept {
   m_needs_reset = true;
 }
 
-bool video_decoder::show_last() {
-  if (!m_have_last || !present(m_last_slot))
-    return false;
-
-  const VkImage y = static_cast<VkImage>(gfx::native(*m_device, m_y).image);
-  const VkImage c = static_cast<VkImage>(gfx::native(*m_device, m_cbcr).image);
-  if (y == VK_NULL_HANDLE || c == VK_NULL_HANDLE)
-    return false;
-  const VkDevice dev = gfx::vk::logical_device(*m_device);
-
-  NX_GFX_VK_TRY(*m_device, vkResetCommandBuffer(m_gfx_cmd, 0));
-  VkCommandBufferBeginInfo begin_cmd{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  begin_cmd.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  NX_GFX_VK_TRY(*m_device, vkBeginCommandBuffer(m_gfx_cmd, &begin_cmd));
-
-  const auto barrier = [&](const VkImage image, const VkImageLayout from,
-                           const VkImageLayout to) {
-    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    b.srcAccessMask =
-        VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    b.dstAccessMask =
-        VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-    b.oldLayout = from;
-    b.newLayout = to;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    d.imageMemoryBarrierCount = 1;
-    d.pImageMemoryBarriers = &b;
-    vkCmdPipelineBarrier2KHR(m_gfx_cmd, &d);
-  };
-
-  barrier(m_sampleable.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-  barrier(y, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-  barrier(c, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-
-  const auto copy_plane = [&](const VkImageAspectFlagBits src_aspect,
-                              const VkImage dst, const u32 w, const u32 h) {
-    VkImageCopy region{};
-    region.srcSubresource = {nx::cast<VkImageAspectFlags>(src_aspect), 0, 0, 1};
-    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.extent = {w, h, 1};
-    vkCmdCopyImage(m_gfx_cmd, m_sampleable.image,
-                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-  };
-  copy_plane(VK_IMAGE_ASPECT_PLANE_0_BIT, y, m_extent.width, m_extent.height);
-  copy_plane(VK_IMAGE_ASPECT_PLANE_1_BIT, c, m_extent.width / 2,
-             m_extent.height / 2);
-
-  barrier(y, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  barrier(c, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  barrier(m_sampleable.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  NX_GFX_VK_TRY(*m_device, vkEndCommandBuffer(m_gfx_cmd));
-
-  NX_GFX_VK_TRY(*m_device, vkResetFences(dev, 1, &m_gfx_fence));
-  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &m_gfx_cmd;
-  NX_GFX_VK_TRY(*m_device,
-                gfx::vk::submit_graphics(*m_device, {&submit, 1}, m_gfx_fence));
-  NX_GFX_VK_TRY(*m_device,
-                vkWaitForFences(dev, 1, &m_gfx_fence, VK_TRUE, ~0ull));
-
-  gfx::set_texture_state(*m_device, m_y, gfx::resource_state::ShaderReadOnly);
-  gfx::set_texture_state(*m_device, m_cbcr,
-                         gfx::resource_state::ShaderReadOnly);
-  return true;
-}
+bool video_decoder::show_last() { return m_have_last && present(m_last_slot); }
 
 } // namespace nx::gfx::video
 

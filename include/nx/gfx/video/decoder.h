@@ -67,6 +67,9 @@ public:
 
   [[nodiscard]] bool decode_frame(const u8 *frame, u32 size, bool &shown,
                                   u32 &width, u32 &height);
+  /// Copies the last decoded picture into new luma and chroma textures and
+  /// retires the previous ones. False, keeping them, while every plane pair
+  /// is still read by frames in flight.
   [[nodiscard]] bool show_last();
   [[nodiscard]] nx::gfx::texture_handle luma_texture() const noexcept {
     return m_y;
@@ -87,10 +90,14 @@ private:
   [[nodiscard]] bool
   create_bitstream_buffer(u64 capacity,
                           const VkVideoProfileListInfoKHR &profiles);
-  [[nodiscard]] bool create_sampleable_image(const u32 *families,
-                                             u32 family_count);
-  [[nodiscard]] bool create_plane_resources();
   [[nodiscard]] u32 allocate_slot() noexcept;
+
+  struct plane_pair;
+  struct plane_pool;
+  [[nodiscard]] plane_pair *free_planes();
+  [[nodiscard]] nx::gfx::texture_handle
+  wrap_plane(plane_pair &pair, const video_image &plane, nx::gfx::format format,
+             VkExtent2D extent, nx::string_view name);
 
   nx::gfx::device *m_device = nullptr;
   VkQueue m_video_queue = VK_NULL_HANDLE;
@@ -99,7 +106,6 @@ private:
   nx::small_vector<VkDeviceMemory, 4> m_memories;
   nx::small_vector<video_image, 16> m_dpb;
   video_image m_output;
-  video_image m_sampleable;
   bool m_coincide = false;
   VkFormat m_picture_format = VK_FORMAT_UNDEFINED;
   VkFormat m_dpb_format = VK_FORMAT_UNDEFINED;
@@ -128,9 +134,10 @@ private:
   u32 m_last_slot = 0;
   bool m_have_last = false;
 
-  VkCommandPool m_gfx_pool = VK_NULL_HANDLE;
-  VkCommandBuffer m_gfx_cmd = VK_NULL_HANDLE;
-  VkFence m_gfx_fence = VK_NULL_HANDLE;
+  /// Shown pictures go to a free pair of plane images, shared with the
+  /// device's queue families, which the device samples as wrapped textures.
+  plane_pool *m_planes = nullptr;
+  nx::small_vector<u32, 4> m_plane_families;
   nx::gfx::texture_handle m_y;
   nx::gfx::texture_handle m_cbcr;
 };
