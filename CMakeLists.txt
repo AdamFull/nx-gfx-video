@@ -53,5 +53,6 @@ endif ()
 add_library(nx::gfx_video ALIAS nx_gfx_video)
 
 if (NX_GFX_VIDEO_TESTS AND NOT APPLE)
+    enable_testing()
     add_subdirectory(tests)
 endif ()
