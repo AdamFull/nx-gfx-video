@@ -370,8 +370,8 @@ void video_decoder::shutdown() noexcept {
       vkDestroyBuffer(dev, m_bitstream, nullptr);
     if (m_bitstream_memory != VK_NULL_HANDLE)
       vkFreeMemory(dev, m_bitstream_memory, nullptr);
-    if (m_fence != VK_NULL_HANDLE)
-      vkDestroyFence(dev, m_fence, nullptr);
+    if (m_timeline != VK_NULL_HANDLE)
+      gfx::vk::release_frame_wait(*m_device, m_timeline);
     if (m_pool != VK_NULL_HANDLE)
       vkDestroyCommandPool(dev, m_pool, nullptr);
     for (video_image &image : m_dpb)
@@ -392,14 +392,18 @@ void video_decoder::shutdown() noexcept {
   m_output = {};
   m_coincide = false;
   m_pool = VK_NULL_HANDLE;
-  m_cmd = VK_NULL_HANDLE;
-  m_fence = VK_NULL_HANDLE;
+  for (submission &s : m_submissions)
+    s = {};
+  m_next_submission = 0;
+  m_timeline = VK_NULL_HANDLE;
+  m_submitted = 0;
   m_video_supports_transfer = false;
   m_needs_reset = true;
   m_bitstream = VK_NULL_HANDLE;
   m_bitstream_memory = VK_NULL_HANDLE;
   m_bitstream_mapped = nullptr;
   m_bitstream_capacity = 0;
+  m_bitstream_stride = 0;
   m_bitstream_offset_align = 1;
   m_bitstream_size_align = 1;
   for (u32 i = 0; i < 8; ++i)
@@ -656,27 +660,91 @@ bool video_decoder::create_command_resources() {
                                                      &m_pool)) != VK_SUCCESS)
     return false;
 
+  VkCommandBuffer cmds[SUBMISSIONS] = {};
   VkCommandBufferAllocateInfo alloc{
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
   alloc.commandPool = m_pool;
   alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  alloc.commandBufferCount = 1;
-  if (NX_GFX_VK_CHECK(*m_device, vkAllocateCommandBuffers(
-                                     dev, &alloc, &m_cmd)) != VK_SUCCESS)
+  alloc.commandBufferCount = SUBMISSIONS;
+  if (NX_GFX_VK_CHECK(*m_device, vkAllocateCommandBuffers(dev, &alloc, cmds)) !=
+      VK_SUCCESS)
     return false;
+  for (u32 i = 0; i < SUBMISSIONS; ++i)
+    m_submissions[i].cmd = cmds[i];
 
-  VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  return NX_GFX_VK_CHECK(*m_device, vkCreateFence(dev, &fence, nullptr,
-                                                  &m_fence)) == VK_SUCCESS;
+  m_timeline = gfx::vk::acquire_frame_wait(*m_device);
+  return m_timeline != VK_NULL_HANDLE;
 }
 
 bool video_decoder::create_bitstream_buffer(
     const u64 capacity, const VkVideoProfileListInfoKHR &profiles) {
   m_bitstream_capacity = align_up64(capacity, m_bitstream_size_align);
-  return create_host_buffer(
-      *m_device, gfx::vk::physical_device(*m_device), m_bitstream_capacity,
-      VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR, &profiles, m_bitstream,
-      m_bitstream_memory, m_bitstream_mapped);
+  m_bitstream_stride =
+      align_up64(m_bitstream_capacity, m_bitstream_offset_align);
+  return create_host_buffer(*m_device, gfx::vk::physical_device(*m_device),
+                            m_bitstream_stride * SUBMISSIONS,
+                            VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR, &profiles,
+                            m_bitstream, m_bitstream_memory,
+                            m_bitstream_mapped);
+}
+
+u32 video_decoder::begin_submission() {
+  const u32 index = m_next_submission;
+  submission &s = m_submissions[index];
+  const VkDevice dev = gfx::vk::logical_device(*m_device);
+  // Waits only when every submission is still on the queue.
+  VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+  wait.semaphoreCount = 1;
+  wait.pSemaphores = &m_timeline;
+  wait.pValues = &s.value;
+  if (s.value != 0 &&
+      NX_GFX_VK_CHECK(*m_device, vkWaitSemaphoresKHR(dev, &wait, ~0ull)) !=
+          VK_SUCCESS)
+    return ~0u;
+
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (NX_GFX_VK_CHECK(*m_device, vkResetCommandBuffer(s.cmd, 0)) !=
+          VK_SUCCESS ||
+      NX_GFX_VK_CHECK(*m_device, vkBeginCommandBuffer(s.cmd, &begin)) !=
+          VK_SUCCESS)
+    return ~0u;
+
+  // The queue runs decodes and copies back to back: each submission's work
+  // comes after everything earlier on it, the DPB writes it reads included.
+  VkMemoryBarrier2 after{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  after.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  after.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+  after.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  after.dstAccessMask =
+      VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+  VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dep.memoryBarrierCount = 1;
+  dep.pMemoryBarriers = &after;
+  vkCmdPipelineBarrier2KHR(s.cmd, &dep);
+  return index;
+}
+
+bool video_decoder::end_submission(const u32 index) {
+  submission &s = m_submissions[index];
+  NX_GFX_VK_TRY(*m_device, vkEndCommandBuffer(s.cmd));
+  const u64 value = m_submitted + 1;
+  VkTimelineSemaphoreSubmitInfo timeline{
+      VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+  timeline.signalSemaphoreValueCount = 1;
+  timeline.pSignalSemaphoreValues = &value;
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.pNext = &timeline;
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &s.cmd;
+  submit.signalSemaphoreCount = 1;
+  submit.pSignalSemaphores = &m_timeline;
+  NX_GFX_VK_TRY(*m_device,
+                vkQueueSubmit(m_video_queue, 1, &submit, VK_NULL_HANDLE));
+  m_submitted = value;
+  s.value = value;
+  m_next_submission = (index + 1) % SUBMISSIONS;
+  return true;
 }
 
 u32 video_decoder::allocate_slot() noexcept {
@@ -744,10 +812,16 @@ bool video_decoder::decode(const u8 *const frame, const u32 size,
   const u64 range = align_up64(size, m_bitstream_size_align);
   if (range > m_bitstream_capacity)
     return false;
-  std::memcpy(m_bitstream_mapped, frame, size);
+  const u32 index = begin_submission();
+  if (index == ~0u)
+    return false;
+  const VkCommandBuffer cmd = m_submissions[index].cmd;
+  const u64 bitstream_offset = index * m_bitstream_stride;
+  u8 *const bitstream =
+      static_cast<u8 *>(m_bitstream_mapped) + bitstream_offset;
+  std::memcpy(bitstream, frame, size);
   if (range > size)
-    std::memset(static_cast<u8 *>(m_bitstream_mapped) + size, 0,
-                nx::cast<usize>(range - size));
+    std::memset(bitstream + size, 0, nx::cast<usize>(range - size));
 
   const u32 setup = allocate_slot();
 
@@ -831,19 +905,12 @@ bool video_decoder::decode(const u8 *const frame, const u32 size,
   VkVideoDecodeInfoKHR di{VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR};
   di.pNext = &vp9pic;
   di.srcBuffer = m_bitstream;
-  di.srcBufferOffset = 0;
+  di.srcBufferOffset = bitstream_offset;
   di.srcBufferRange = range;
   di.dstPictureResource = dst_res;
   di.pSetupReferenceSlot = &setup_slot;
   di.referenceSlotCount = ref_count;
   di.pReferenceSlots = ref_count != 0 ? decode_refs : nullptr;
-
-  const VkDevice dev = gfx::vk::logical_device(*m_device);
-  NX_GFX_VK_TRY(*m_device, vkResetCommandBuffer(m_cmd, 0));
-  VkCommandBufferBeginInfo begin_cmd{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  begin_cmd.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  NX_GFX_VK_TRY(*m_device, vkBeginCommandBuffer(m_cmd, &begin_cmd));
 
   // Bring every image the decode touches into its decode layout. References are
   // already there from earlier decodes and skip the barrier.
@@ -876,7 +943,7 @@ bool video_decoder::decode(const u8 *const frame, const u32 size,
     VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dep.imageMemoryBarrierCount = barrier_count;
     dep.pImageMemoryBarriers = barriers;
-    vkCmdPipelineBarrier2KHR(m_cmd, &dep);
+    vkCmdPipelineBarrier2KHR(cmd, &dep);
   }
 
   VkVideoBeginCodingInfoKHR begin{
@@ -884,28 +951,22 @@ bool video_decoder::decode(const u8 *const frame, const u32 size,
   begin.videoSession = m_session;
   begin.referenceSlotCount = ref_count + 1;
   begin.pReferenceSlots = begin_slots;
-  vkCmdBeginVideoCodingKHR(m_cmd, &begin);
+  vkCmdBeginVideoCodingKHR(cmd, &begin);
 
   if (m_needs_reset) {
     VkVideoCodingControlInfoKHR control{
         VK_STRUCTURE_TYPE_VIDEO_CODING_CONTROL_INFO_KHR};
     control.flags = VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR;
-    vkCmdControlVideoCodingKHR(m_cmd, &control);
+    vkCmdControlVideoCodingKHR(cmd, &control);
     m_needs_reset = false;
   }
 
-  vkCmdDecodeVideoKHR(m_cmd, &di);
+  vkCmdDecodeVideoKHR(cmd, &di);
 
   VkVideoEndCodingInfoKHR end{VK_STRUCTURE_TYPE_VIDEO_END_CODING_INFO_KHR};
-  vkCmdEndVideoCodingKHR(m_cmd, &end);
-  NX_GFX_VK_TRY(*m_device, vkEndCommandBuffer(m_cmd));
-
-  NX_GFX_VK_TRY(*m_device, vkResetFences(dev, 1, &m_fence));
-  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &m_cmd;
-  NX_GFX_VK_TRY(*m_device, vkQueueSubmit(m_video_queue, 1, &submit, m_fence));
-  NX_GFX_VK_TRY(*m_device, vkWaitForFences(dev, 1, &m_fence, VK_TRUE, ~0ull));
+  vkCmdEndVideoCodingKHR(cmd, &end);
+  if (!end_submission(index))
+    return false;
 
   m_slot_width[setup] = coded_w;
   m_slot_height[setup] = coded_h;
@@ -989,12 +1050,10 @@ bool video_decoder::present(const u32 slot) {
                                     ? VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR
                                     : VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR;
 
-  const VkDevice dev = gfx::vk::logical_device(*m_device);
-  NX_GFX_VK_TRY(*m_device, vkResetCommandBuffer(m_cmd, 0));
-  VkCommandBufferBeginInfo begin_cmd{
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  begin_cmd.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  NX_GFX_VK_TRY(*m_device, vkBeginCommandBuffer(m_cmd, &begin_cmd));
+  const u32 index = begin_submission();
+  if (index == ~0u)
+    return false;
+  const VkCommandBuffer cmd = m_submissions[index].cmd;
 
   const auto barrier = [&](video_image &img, const VkImageLayout to) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -1014,7 +1073,7 @@ bool video_decoder::present(const u32 slot) {
     VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dep.imageMemoryBarrierCount = 1;
     dep.pImageMemoryBarriers = &b;
-    vkCmdPipelineBarrier2KHR(m_cmd, &dep);
+    vkCmdPipelineBarrier2KHR(cmd, &dep);
   };
 
   // A free pair's last contents were shown already; frames may have left it
@@ -1032,7 +1091,7 @@ bool video_decoder::present(const u32 slot) {
     region.srcSubresource = {nx::cast<VkImageAspectFlags>(aspect), 0, 0, 1};
     region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.extent = {w, h, 1};
-    vkCmdCopyImage(m_cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdCopyImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
   };
   copy_plane(VK_IMAGE_ASPECT_PLANE_0_BIT, planes->y, m_extent.width,
@@ -1043,14 +1102,10 @@ bool video_decoder::present(const u32 slot) {
   barrier(src, restore);
   barrier(planes->y, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   barrier(planes->cbcr, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  NX_GFX_VK_TRY(*m_device, vkEndCommandBuffer(m_cmd));
-
-  NX_GFX_VK_TRY(*m_device, vkResetFences(dev, 1, &m_fence));
-  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &m_cmd;
-  NX_GFX_VK_TRY(*m_device, vkQueueSubmit(m_video_queue, 1, &submit, m_fence));
-  NX_GFX_VK_TRY(*m_device, vkWaitForFences(dev, 1, &m_fence, VK_TRUE, ~0ull));
+  if (!end_submission(index))
+    return false;
+  // Before the planes have handles, so every frame that can sample them waits.
+  gfx::vk::wait_before_frame(*m_device, {m_timeline, m_submitted});
 
   const gfx::texture_handle y = wrap_plane(
       *planes, planes->y, gfx::format::R8_UNORM, m_extent, "video luma");

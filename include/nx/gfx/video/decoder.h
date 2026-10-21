@@ -87,6 +87,11 @@ private:
   [[nodiscard]] bool decode(const u8 *frame, u32 size, decoded_picture &out);
   [[nodiscard]] bool present(u32 slot);
   [[nodiscard]] bool create_command_resources();
+  /// The submission recorded next, begun once the queue is done with it; ~0u
+  /// on failure.
+  [[nodiscard]] u32 begin_submission();
+  /// Submits it, signalling the timeline's next value.
+  [[nodiscard]] bool end_submission(u32 index);
   [[nodiscard]] bool
   create_bitstream_buffer(u64 capacity,
                           const VkVideoProfileListInfoKHR &profiles);
@@ -114,15 +119,27 @@ private:
   u32 m_max_dpb_slots = 0;
 
   VkCommandPool m_pool = VK_NULL_HANDLE;
-  VkCommandBuffer m_cmd = VK_NULL_HANDLE;
-  VkFence m_fence = VK_NULL_HANDLE;
+  static constexpr u32 SUBMISSIONS = 4;
+  struct submission {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    /// The timeline value its last submit signals.
+    u64 value = 0;
+  };
+  submission m_submissions[SUBMISSIONS];
+  u32 m_next_submission = 0;
+  /// Every submission signals it, and frames wait on it for the planes; the
+  /// device owns it.
+  VkSemaphore m_timeline = VK_NULL_HANDLE;
+  u64 m_submitted = 0;
   bool m_video_supports_transfer = false;
   bool m_needs_reset = true;
 
   VkBuffer m_bitstream = VK_NULL_HANDLE;
   VkDeviceMemory m_bitstream_memory = VK_NULL_HANDLE;
   void *m_bitstream_mapped = nullptr;
+  /// Per submission, each its own range of the buffer.
   u64 m_bitstream_capacity = 0;
+  u64 m_bitstream_stride = 0;
   u64 m_bitstream_offset_align = 1;
   u64 m_bitstream_size_align = 1;
 

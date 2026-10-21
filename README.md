@@ -49,6 +49,11 @@ picture shown and the previous ones retire as any texture does. The decoder
 keeps at most eight pairs; while frames still read all of them, `show_last`
 fails and the last picture stays.
 
+Neither call waits for the GPU: decodes and copies go to the decode queue, and
+frames wait on its timeline (`nx::gfx::vk::wait_before_frame`) before they
+sample. The caller blocks only when four submissions are still on the queue.
+A readback of the planes outside a frame sees the copy after the next frame.
+
 `query_decode_caps` reports what a device can decode without making a session;
 `parse_vp9_frame_header` (`nx/gfx/video/vp9.h`) reads the uncompressed VP9
 frame header the session needs.
